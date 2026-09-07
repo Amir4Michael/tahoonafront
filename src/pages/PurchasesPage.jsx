@@ -17,6 +17,35 @@ import { inp, btn, btnOutline, thCls, tdCls } from '@/components/shop/styles';
 const SUPPLIER_LIMIT = 100;
 const PRODUCT_PICKER_LIMIT = 100;
 
+// Keeps exactly what the person typed on screen (so backspace/clearing feels
+// natural and the cursor never jumps to the end), while only allowing the
+// characters a decimal amount can actually contain — digits and a single
+// decimal point. Used for both the per-line purchase-price editor and the
+// discount field below; the numeric value used in calculations is derived
+// separately from this text, so an empty/partial string never gets silently
+// coerced into a "0" that overwrites what the person is mid-way through
+// typing. (Same helper as PosPage.jsx — duplicated rather than shared to
+// keep this change contained to the two files that actually need it.)
+const sanitizeDecimalText = (raw) => {
+  let value = String(raw).replace(/[^0-9.]/g, '');
+  const dot = value.indexOf('.');
+  if (dot !== -1) value = value.slice(0, dot + 1) + value.slice(dot + 1).replace(/\./g, '');
+  return value;
+};
+const decimalTextToNumber = (text) => {
+  if (text === '' || text === '.') return 0;
+  const n = parseFloat(text);
+  return Number.isNaN(n) ? 0 : n;
+};
+
+// Purchase quantities are always whole units — same "never force to 0 while
+// typing, no cursor jump" principle as sanitizeDecimalText, just digits only
+// (no decimal point). Added during the full regression audit: this line's
+// quantity input was still a plain type="number" field, inconsistent with
+// price/discount right next to it.
+const sanitizeIntegerText = (raw) => String(raw).replace(/[^0-9]/g, '');
+const integerTextToNumber = (text) => (text === '' ? 0 : parseInt(text, 10) || 0);
+
 export function PurchasesPage() {
   const navigate = useNavigate();
 
@@ -31,6 +60,10 @@ export function PurchasesPage() {
   const [showAddProduct, setShowAddProduct] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState('cash');
   const [paidInput, setPaidInput] = useState('');
+  // Flat (fixed-amount) discount on the purchase total — kept as raw typed
+  // text (see sanitizeDecimalText above), never as a pre-rounded number, so
+  // the input never fights the person while they're typing or clearing it.
+  const [discountText, setDiscountText] = useState('');
   const [date, setDate] = useState(todayInputValue());
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
@@ -44,7 +77,15 @@ export function PurchasesPage() {
       .catch((err) => toast.error(err.message || 'تعذر تحميل المنتجات'));
   }, []);
 
-  const total = lines.reduce((s, l) => s + (Number(l.price) || 0) * (Number(l.quantity) || 0), 0);
+  // Sum of the lines (price*quantity) BEFORE the discount — product prices
+  // themselves are never touched by the discount, only this purchase's own
+  // total is. `discount` is clamped here ONLY for what's displayed/sent as
+  // the running total preview, never on the input's own text (see below),
+  // so the field itself always shows exactly what was typed.
+  const subtotal = lines.reduce((s, l) => s + (Number(l.price) || 0) * (Number(l.quantity) || 0), 0);
+  const discount = decimalTextToNumber(discountText);
+  const discountExceedsSubtotal = discount > subtotal;
+  const total = Math.max(0, subtotal - Math.min(discount, subtotal));
   const paid = paymentMethod === 'cash' ? total : Math.min(total, Number(paidInput) || 0);
   const remaining = Math.max(0, total - paid);
 
@@ -66,15 +107,34 @@ export function PurchasesPage() {
         name: p.name,
         code: p.code,
         price: p.purchasePrice || 0,
+        priceText: String(p.purchasePrice || 0),
         quantity: 1,
+        quantityText: '1',
       },
     ]);
     setPick('');
   };
 
-  const updateLine = (id, k, v) => {
-    const val = Math.max(0, Number(v) || 0);
-    setLines(lines.map((l) => (l.productId === id ? { ...l, [k]: val } : l)));
+  // Editable purchase quantity per line — same "keep the raw typed text"
+  // principle as updatePrice below: whole units only (no decimal point),
+  // so clearing/retyping feels natural instead of snapping back to a
+  // forced minimum on every keystroke.
+  const updateQuantity = (id, raw) => {
+    const text = sanitizeIntegerText(raw);
+    setLines((prev) => prev.map((l) => (
+      l.productId === id ? { ...l, quantity: integerTextToNumber(text), quantityText: text } : l
+    )));
+  };
+
+  // Editable purchase price per line — keeps the raw typed text (priceText)
+  // as the input's source of truth and derives the numeric price used in
+  // totals/weighted-average separately, so clearing/retyping the field
+  // feels natural instead of being forced back to "0" on every keystroke.
+  const updatePrice = (id, raw) => {
+    const text = sanitizeDecimalText(raw);
+    setLines((prev) => prev.map((l) => (
+      l.productId === id ? { ...l, price: decimalTextToNumber(text), priceText: text } : l
+    )));
   };
 
   // Product created on the fly from within the purchase screen. We build the
@@ -87,7 +147,15 @@ export function PurchasesPage() {
     if (lines.some((l) => l.productId === product._id)) return;
     setLines((prev) => [
       ...prev,
-      { productId: product._id, name: product.name, code: product.code, price: product.purchasePrice || 0, quantity: 1 },
+      {
+        productId: product._id,
+        name: product.name,
+        code: product.code,
+        price: product.purchasePrice || 0,
+        priceText: String(product.purchasePrice || 0),
+        quantity: 1,
+        quantityText: '1',
+      },
     ]);
     setPick('');
   };
@@ -123,6 +191,16 @@ export function PurchasesPage() {
       return;
     }
 
+    if (discount < 0) {
+      toast.error('قيمة الخصم غير صحيحة');
+      return;
+    }
+
+    if (discountExceedsSubtotal) {
+      toast.error('الخصم أكبر من إجمالي العملية');
+      return;
+    }
+
     setSaving(true);
     try {
       await purchasesApi.createPurchase({
@@ -131,6 +209,7 @@ export function PurchasesPage() {
         paid,
         date,
         notes,
+        discount,
         items: lines.map((l) => ({
           productId: l.productId,
           quantity: Number(l.quantity),
@@ -143,6 +222,7 @@ export function PurchasesPage() {
       setPaidInput('');
       setNotes('');
       setPaymentMethod('cash');
+      setDiscountText('');
       navigate('/purchases/history');
     } catch (err) {
       toast.error(err.message || 'تعذر تسجيل عملية الشراء');
@@ -279,20 +359,22 @@ export function PurchasesPage() {
                   </td>
                   <td className={tdCls}>
                     <input
-                      type="number"
-                      min="1"
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="off"
                       className="h-9 w-20 rounded-lg border bg-background px-2 font-mono text-sm"
-                      value={l.quantity}
-                      onChange={(e) => updateLine(l.productId, 'quantity', e.target.value)}
+                      value={l.quantityText ?? String(l.quantity)}
+                      onChange={(e) => updateQuantity(l.productId, e.target.value)}
                     />
                   </td>
                   <td className={tdCls}>
                     <input
-                      type="number"
-                      min="0"
+                      type="text"
+                      inputMode="decimal"
+                      autoComplete="off"
                       className="h-9 w-28 rounded-lg border bg-background px-2 font-mono text-sm"
-                      value={l.price}
-                      onChange={(e) => updateLine(l.productId, 'price', e.target.value)}
+                      value={l.priceText ?? String(l.price)}
+                      onChange={(e) => updatePrice(l.productId, e.target.value)}
                     />
                   </td>
                   <td className={`${tdCls} font-bold font-mono`}>
@@ -350,24 +432,56 @@ export function PurchasesPage() {
           {paymentMethod === 'credit' && (
             <Field label="المبلغ المدفوع حاصلاً">
               <input
-                type="number"
-                min="0"
-                max={total}
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
                 className={`${inp} font-mono`}
                 value={paidInput}
-                onChange={(e) => setPaidInput(e.target.value)}
+                onChange={(e) => setPaidInput(sanitizeDecimalText(e.target.value))}
                 placeholder="0"
               />
             </Field>
           )}
+
+          <Field label="الخصم (مبلغ ثابت على إجمالي العملية)">
+            <input
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              className={`${inp} font-mono`}
+              value={discountText}
+              onChange={(e) => setDiscountText(sanitizeDecimalText(e.target.value))}
+              placeholder="0"
+            />
+            {discountExceedsSubtotal && (
+              <p className="mt-1 text-xs font-semibold text-destructive">الخصم أكبر من إجمالي العملية</p>
+            )}
+          </Field>
         </div>
 
         <div className="grid content-between gap-3">
           <div className="space-y-2 rounded-xl bg-muted/50 p-4 text-sm">
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">إجمالي الفاتورة:</span>
-              <b className="text-lg font-mono text-primary">{fmtMoney(total)}</b>
-            </div>
+            {discount > 0 ? (
+              <>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">إجمالي المنتجات:</span>
+                  <b className="font-mono text-foreground">{fmtMoney(subtotal)}</b>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">الخصم:</span>
+                  <b className="font-mono text-destructive">- {fmtMoney(Math.min(discount, subtotal))}</b>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">الإجمالي النهائي:</span>
+                  <b className="text-lg font-mono text-primary">{fmtMoney(total)}</b>
+                </div>
+              </>
+            ) : (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">إجمالي الفاتورة:</span>
+                <b className="text-lg font-mono text-primary">{fmtMoney(total)}</b>
+              </div>
+            )}
             <div className="flex justify-between">
               <span className="text-muted-foreground">المدفوع:</span>
               <b className="font-mono text-emerald-600">{fmtMoney(paid)}</b>
@@ -382,7 +496,7 @@ export function PurchasesPage() {
 
           <button
             onClick={save}
-            disabled={lines.length === 0 || saving}
+            disabled={lines.length === 0 || saving || discountExceedsSubtotal}
             className={`${btn} h-12 w-full text-base font-bold gap-2`}
           >
             {saving ? <Loader2 size={18} className="animate-spin" /> : <CheckCircle2 size={18} />} حفظ عملية الشراء

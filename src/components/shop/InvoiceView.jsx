@@ -90,8 +90,21 @@ export function InvoiceView({ sale, customer, settings }) {
 
       {/* Totals Section */}
       <div className="rounded-xl border border-dashed border-slate-300 p-3.5 space-y-2 text-xs font-sans bg-slate-50/50">
+        {sale.discount > 0 && (
+          <>
+            <div className="flex justify-between text-slate-500">
+              <span>إجمالي المنتجات</span>
+              <span className="font-bold font-mono text-slate-700">{fmtMoney(sale.subtotal ?? sale.total + sale.discount)}</span>
+            </div>
+            <div className="flex justify-between text-red-600">
+              <span>الخصم</span>
+              <span className="font-bold font-mono">- {fmtMoney(sale.discount)}</span>
+            </div>
+          </>
+        )}
+
         <div className="flex justify-between text-slate-600">
-          <span>الإجمالي الكلي</span>
+          <span>{sale.discount > 0 ? 'الإجمالي النهائي' : 'الإجمالي الكلي'}</span>
           <span className="font-bold font-mono text-slate-900 text-sm">{fmtMoney(sale.total)}</span>
         </div>
 

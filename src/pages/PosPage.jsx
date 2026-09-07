@@ -29,6 +29,25 @@ const PRODUCT_PICKER_LIMIT = 40;
 // would only see the first 100 (by creation order) in this quick-picker.
 const CUSTOMER_PICKER_LIMIT = 100;
 
+// Keeps exactly what the person typed on screen (so backspace/clearing feels
+// natural and the cursor never jumps to the end), while only allowing the
+// characters a decimal amount can actually contain — digits and a single
+// decimal point. Used for both the per-line price editor and the discount
+// field below; the numeric value used in calculations is derived separately
+// from this text, so an empty/partial string never gets silently coerced
+// into a "0" that overwrites what the person is mid-way through typing.
+const sanitizeDecimalText = (raw) => {
+  let value = String(raw).replace(/[^0-9.]/g, '');
+  const dot = value.indexOf('.');
+  if (dot !== -1) value = value.slice(0, dot + 1) + value.slice(dot + 1).replace(/\./g, '');
+  return value;
+};
+const decimalTextToNumber = (text) => {
+  if (text === '' || text === '.') return 0;
+  const n = parseFloat(text);
+  return Number.isNaN(n) ? 0 : n;
+};
+
 export function PosPage() {
   const { settings } = useSettings();
   const [search, setSearch] = useState('');
@@ -40,6 +59,10 @@ export function PosPage() {
   const [savingCustomer, setSavingCustomer] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState('cash');
   const [paidInput, setPaidInput] = useState('');
+  // Flat (fixed-amount) discount on the invoice total — kept as raw typed
+  // text (see sanitizeDecimalText above), never as a pre-rounded number, so
+  // the input never fights the person while they're typing or clearing it.
+  const [discountText, setDiscountText] = useState('');
   const [invoice, setInvoice] = useState(null);
   const [completing, setCompleting] = useState(false);
   const [printing, startPrint] = usePrint();
@@ -67,7 +90,15 @@ export function PosPage() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [cart.length]);
 
-  const total = cart.reduce((s, i) => s + i.price * i.quantity, 0);
+  // Sum of the cart lines (price*quantity) BEFORE the discount — product
+  // prices themselves are never touched by the discount, only this invoice
+  // total is. `discount` is clamped here ONLY for what's displayed/sent as
+  // the running total preview, never on the input's own text (see below),
+  // so the field itself always shows exactly what was typed.
+  const subtotal = cart.reduce((s, i) => s + i.price * i.quantity, 0);
+  const discount = decimalTextToNumber(discountText);
+  const discountExceedsSubtotal = discount > subtotal;
+  const total = Math.max(0, subtotal - Math.min(discount, subtotal));
   const paid = paymentMethod === 'cash' ? total : (Number(paidInput) || 0);
   const remaining = total - paid;
 
@@ -79,7 +110,7 @@ export function PosPage() {
         if (ex.quantity >= p.quantity) { toast.warning(`الكمية المتاحة من "${p.name}" هي ${p.quantity} فقط`); return prev; }
         return prev.map((i) => (i.productId === p._id ? { ...i, quantity: i.quantity + 1 } : i));
       }
-      return [...prev, { productId: p._id, name: p.name, code: p.code, price: p.salePrice, quantity: 1 }];
+      return [...prev, { productId: p._id, name: p.name, code: p.code, price: p.salePrice, priceText: String(p.salePrice), quantity: 1 }];
     });
   };
   const changeQty = (id, delta) => setCart((prev) => prev.map((i) => {
@@ -92,11 +123,17 @@ export function PosPage() {
   }));
   const removeItem = (id) => setCart((prev) => prev.filter((i) => i.productId !== id));
 
-  // Editable sale price — applies to this transaction's line only, never to the
-  // product's own base sale price stored in the catalog.
-  const changePrice = (id, value) => setCart((prev) => prev.map((i) => (
-    i.productId === id ? { ...i, price: Math.max(0, Number(value) || 0) } : i
-  )));
+  // Editable sale price — applies to this transaction's line only, never to
+  // the product's own base sale price stored in the catalog. Keeps the raw
+  // typed text (priceText) as the input's source of truth and derives the
+  // numeric price used in totals separately, so clearing/retyping the field
+  // feels natural instead of being forced back to "0" on every keystroke.
+  const changePrice = (id, raw) => {
+    const text = sanitizeDecimalText(raw);
+    setCart((prev) => prev.map((i) => (
+      i.productId === id ? { ...i, price: decimalTextToNumber(text), priceText: text } : i
+    )));
+  };
 
   // Product created on the fly from within the POS screen: add it straight
   // to the cart using the real document the API just returned, and refresh
@@ -126,6 +163,8 @@ export function PosPage() {
 
   const handleComplete = async () => {
     if (cart.length === 0) { toast.error('الفاتورة فارغة، أضف منتجات أولاً'); return; }
+    if (discount < 0) { toast.error('قيمة الخصم غير صحيحة'); return; }
+    if (discountExceedsSubtotal) { toast.error('الخصم أكبر من إجمالي الفاتورة'); return; }
     setCompleting(true);
     try {
       const res = await salesApi.createSale({
@@ -133,9 +172,10 @@ export function PosPage() {
         items: cart.map((i) => ({ productId: i.productId, quantity: i.quantity, price: i.price })),
         paymentMethod,
         paid,
+        discount,
       });
       setInvoice(res.data);
-      setCart([]); setPaidInput(''); setCustomerId(''); setPaymentMethod('cash');
+      setCart([]); setPaidInput(''); setCustomerId(''); setPaymentMethod('cash'); setDiscountText('');
       reloadProducts(); // stock just changed
     } catch (err) {
       toast.error(err.message || 'تعذر إتمام عملية البيع');
@@ -207,11 +247,12 @@ export function PosPage() {
                     <div className="mt-1 flex items-center gap-1.5">
                       <Pencil size={10} className="shrink-0 text-muted-foreground/60" />
                       <input
-                        type="number"
-                        min="0"
+                        type="text"
+                        inputMode="decimal"
+                        autoComplete="off"
                         title="سعر بيع مختلف لهذه العملية فقط — لا يغير سعر المنتج الأساسي"
                         className="h-6 w-20 rounded border border-border bg-card px-1.5 text-xs font-mono outline-none transition-shadow focus:border-ring focus:ring-2 focus:ring-ring/20"
-                        value={i.price}
+                        value={i.priceText ?? String(i.price)}
                         onChange={(e) => changePrice(i.productId, e.target.value)}
                       />
                       {isCustomPrice && (
@@ -258,15 +299,55 @@ export function PosPage() {
 
           {paymentMethod === 'credit' && (
             <Field label="المبلغ المدفوع">
-              <input type="number" min="0" className={inp} value={paidInput} onChange={(e) => setPaidInput(e.target.value)} placeholder="0" />
+              <input
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                className={inp}
+                value={paidInput}
+                onChange={(e) => setPaidInput(sanitizeDecimalText(e.target.value))}
+                placeholder="0"
+              />
             </Field>
           )}
 
+          <Field label="الخصم (مبلغ ثابت على إجمالي الفاتورة)">
+            <input
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              className={inp}
+              value={discountText}
+              onChange={(e) => setDiscountText(sanitizeDecimalText(e.target.value))}
+              placeholder="0"
+            />
+            {discountExceedsSubtotal && (
+              <p className="mt-1 text-xs font-semibold text-destructive">الخصم أكبر من إجمالي الفاتورة</p>
+            )}
+          </Field>
+
           <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
-            <div className="flex justify-between py-0.5">
-              <span className="text-muted-foreground">الإجمالي</span>
-              <b className="text-base text-primary">{fmtMoney(total)}</b>
-            </div>
+            {discount > 0 ? (
+              <>
+                <div className="flex justify-between py-0.5">
+                  <span className="text-muted-foreground">إجمالي المنتجات</span>
+                  <b>{fmtMoney(subtotal)}</b>
+                </div>
+                <div className="flex justify-between py-0.5">
+                  <span className="text-muted-foreground">الخصم</span>
+                  <b className="text-destructive">- {fmtMoney(Math.min(discount, subtotal))}</b>
+                </div>
+                <div className="flex justify-between py-0.5">
+                  <span className="text-muted-foreground">الإجمالي النهائي</span>
+                  <b className="text-base text-primary">{fmtMoney(total)}</b>
+                </div>
+              </>
+            ) : (
+              <div className="flex justify-between py-0.5">
+                <span className="text-muted-foreground">الإجمالي</span>
+                <b className="text-base text-primary">{fmtMoney(total)}</b>
+              </div>
+            )}
             <div className="flex justify-between py-0.5">
               <span className="text-muted-foreground">المدفوع</span>
               <b>{fmtMoney(paid)}</b>
@@ -279,7 +360,7 @@ export function PosPage() {
 
           <button
             onClick={handleComplete}
-            disabled={cart.length === 0 || completing}
+            disabled={cart.length === 0 || completing || discountExceedsSubtotal}
             className={`${btn} h-11 w-full text-base`}
           >
             {completing && <Loader2 size={16} className="animate-spin" />} إتمام البيع

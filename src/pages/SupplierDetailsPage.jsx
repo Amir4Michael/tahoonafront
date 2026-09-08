@@ -197,8 +197,7 @@ export function SupplierDetailsPage() {
 
   const returnTotalAmount = returnLines.reduce((s, l) => s + l.amount, 0);
   const returnHasInvalidLine = returnLines.some((l) => l.exceedsAvailable);
-  const returnExceedsSupplierBalance = returnTotalAmount > t.remaining;
-  const returnStepValid = returnLines.length > 0 && !returnHasInvalidLine && !returnExceedsSupplierBalance;
+  const returnStepValid = returnLines.length > 0 && !returnHasInvalidLine;
   const returnNewBalancePreview = Math.max(0, t.remaining - Math.min(returnTotalAmount, t.remaining));
 
   const submitReturn = async () => {
@@ -261,7 +260,7 @@ export function SupplierDetailsPage() {
           </div>
         </div>
 
-        <div className={`mt-5 grid grid-cols-2 gap-3 ${t.returned > 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+        <div className={`mt-5 grid grid-cols-2 gap-3 ${t.creditOwed > 0 ? 'sm:grid-cols-6' : t.returned > 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
           <div className="rounded-lg bg-muted/40 p-3">
             <div className="text-xs text-muted-foreground">إجمالي المشتريات منه</div>
             <div className="mt-1 text-lg font-bold text-foreground">{fmtMoney(t.total)}</div>
@@ -280,6 +279,12 @@ export function SupplierDetailsPage() {
             <div className="text-xs text-muted-foreground">المتبقي له</div>
             <div className="mt-1 text-lg font-bold text-destructive">{fmtMoney(t.remaining)}</div>
           </div>
+          {t.creditOwed > 0 && (
+            <div className="rounded-lg bg-emerald-50 p-3" title="مبلغ زائد ناتج عن مرتجع بقيمة أكبر من المستحق للمورد — مستحق لنا منه">
+              <div className="text-xs text-muted-foreground">رصيد مستحق لنا من المورد</div>
+              <div className="mt-1 text-lg font-bold text-emerald-700">{fmtMoney(t.creditOwed)}</div>
+            </div>
+          )}
           <div className="rounded-lg bg-muted/40 p-3">
             <div className="text-xs text-muted-foreground">عدد العمليات</div>
             <div className="mt-1 text-lg font-bold text-foreground">{t.count}</div>
@@ -526,8 +531,11 @@ export function SupplierDetailsPage() {
             {returnHasInvalidLine && (
               <p className="text-xs font-semibold text-destructive">هناك كمية مطلوب إرجاعها أكبر من المتاح للإرجاع</p>
             )}
-            {returnExceedsSupplierBalance && !returnHasInvalidLine && (
-              <p className="text-xs font-semibold text-destructive">قيمة المرتجع أكبر من المتبقي المستحق لهذا المورد</p>
+            {returnTotalAmount > t.remaining && !returnHasInvalidLine && (
+              <p className="text-xs font-semibold text-amber-600">
+                قيمة المرتجع أكبر من المتبقي لهذا المورد — الفرق ({fmtMoney(returnTotalAmount - t.remaining)}) سيُسجَّل كرصيد
+                مستحق لنا من المورد بعد تنفيذ المرتجع
+              </p>
             )}
 
             <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm">

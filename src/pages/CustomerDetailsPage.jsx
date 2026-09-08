@@ -198,8 +198,7 @@ export function CustomerDetailsPage() {
 
   const returnTotalAmount = returnLines.reduce((s, l) => s + l.amount, 0);
   const returnHasInvalidLine = returnLines.some((l) => l.exceedsAvailable);
-  const returnExceedsCustomerBalance = returnTotalAmount > t.remaining;
-  const returnStepValid = returnLines.length > 0 && !returnHasInvalidLine && !returnExceedsCustomerBalance;
+  const returnStepValid = returnLines.length > 0 && !returnHasInvalidLine;
   const returnNewBalancePreview = Math.max(0, t.remaining - Math.min(returnTotalAmount, t.remaining));
 
   const submitReturn = async () => {
@@ -262,7 +261,7 @@ export function CustomerDetailsPage() {
           </div>
         </div>
 
-        <div className={`mt-5 grid grid-cols-2 gap-3 ${t.returned > 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+        <div className={`mt-5 grid grid-cols-2 gap-3 ${t.creditOwed > 0 ? 'sm:grid-cols-6' : t.returned > 0 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
           <div className="rounded-lg bg-muted/40 p-3">
             <div className="text-xs text-muted-foreground">إجمالي المشتريات</div>
             <div className="mt-1 text-lg font-bold text-foreground">{fmtMoney(t.total)}</div>
@@ -281,6 +280,12 @@ export function CustomerDetailsPage() {
             <div className="text-xs text-muted-foreground">المتبقي</div>
             <div className="mt-1 text-lg font-bold text-destructive">{fmtMoney(t.remaining)}</div>
           </div>
+          {t.creditOwed > 0 && (
+            <div className="rounded-lg bg-emerald-50 p-3" title="مبلغ زائد ناتج عن مرتجع بقيمة أكبر من المديونية — مستحق للعميل (استرداد نقدي أو ترحيل لعملية قادمة)">
+              <div className="text-xs text-muted-foreground">رصيد مستحق للعميل</div>
+              <div className="mt-1 text-lg font-bold text-emerald-700">{fmtMoney(t.creditOwed)}</div>
+            </div>
+          )}
           <div className="rounded-lg bg-muted/40 p-3">
             <div className="text-xs text-muted-foreground">عدد الفواتير</div>
             <div className="mt-1 text-lg font-bold text-foreground">{t.count}</div>
@@ -526,8 +531,11 @@ export function CustomerDetailsPage() {
             {returnHasInvalidLine && (
               <p className="text-xs font-semibold text-destructive">هناك كمية مطلوب إرجاعها أكبر من المتاح للإرجاع</p>
             )}
-            {returnExceedsCustomerBalance && !returnHasInvalidLine && (
-              <p className="text-xs font-semibold text-destructive">قيمة المرتجع أكبر من المتبقي المستحق على العميل</p>
+            {returnTotalAmount > t.remaining && !returnHasInvalidLine && (
+              <p className="text-xs font-semibold text-amber-600">
+                قيمة المرتجع أكبر من المتبقي على العميل — الفرق ({fmtMoney(returnTotalAmount - t.remaining)}) سيُسجَّل كرصيد
+                مستحق للعميل بعد تنفيذ المرتجع
+              </p>
             )}
 
             <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm">

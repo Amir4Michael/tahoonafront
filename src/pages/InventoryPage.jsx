@@ -15,6 +15,7 @@ import { ProductImagePicker } from '@/components/shop/ProductImagePicker';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useApiList } from '@/hooks/useApiList';
 import * as productsApi from '@/services/api/products';
+import * as settingsApi from '@/services/api/settings';
 import { inp, btn, btnOutline, thCls, tdCls } from '@/components/shop/styles';
 
 const emptyProduct = {
@@ -42,6 +43,22 @@ export function InventoryPage() {
   const [details, setDetails] = useState(null);
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // Settings.lowStockThreshold — used ONLY as the pre-filled default for a
+  // brand-new product's own minQuantity below (see openAdd). It was
+  // previously stored/editable in Settings but never actually read
+  // anywhere, so changing it had zero effect anywhere in the system; this
+  // is what makes it do something again, without changing how an existing
+  // product's own minQuantity (which always wins once set) is used.
+  const [defaultMinQuantity, setDefaultMinQuantity] = useState(5);
+
+  useEffect(() => {
+    settingsApi.getSettings()
+      .then((res) => {
+        const v = Number(res?.data?.lowStockThreshold);
+        if (Number.isFinite(v)) setDefaultMinQuantity(v);
+      })
+      .catch(() => {}); // keep the safe fallback of 5 on any failure
+  }, []);
 
   const debouncedSearch = useDebounce(search, 300);
 
@@ -72,7 +89,7 @@ export function InventoryPage() {
 
   const openAdd = () => {
     setEditing(null);
-    setForm(emptyProduct);
+    setForm({ ...emptyProduct, minQuantity: String(defaultMinQuantity) });
     setFormOpen(true);
   };
 
@@ -121,12 +138,26 @@ export function InventoryPage() {
   const handleDelete = async () => {
     if (!deleteTarget) return;
     try {
-      await productsApi.deleteProduct(deleteTarget._id);
-      toast.success('تم حذف المنتج بنجاح');
+      const res = await productsApi.deleteProduct(deleteTarget._id);
+      if (res?.hidden) {
+        toast.success('المنتج له فواتير سابقة، فتم إخفاؤه بدل حذفه نهائياً — تقدر تلاقيه من فلتر "مخفي" وتستعيده وقت ما تحتاج');
+      } else {
+        toast.success('تم حذف المنتج بنجاح');
+      }
       setDeleteTarget(null);
       reload();
     } catch (err) {
       toast.error(err.message || 'تعذر حذف المنتج');
+    }
+  };
+
+  const handleRestore = async (product) => {
+    try {
+      await productsApi.restoreProduct(product._id);
+      toast.success('تم استعادة المنتج، وهيظهر تاني في المخزون والبيع والشراء');
+      reload();
+    } catch (err) {
+      toast.error(err.message || 'تعذر استعادة المنتج');
     }
   };
 
@@ -209,6 +240,7 @@ export function InventoryPage() {
           <option value="available">متوفر</option>
           <option value="low">منخفض</option>
           <option value="out">نافذ</option>
+          <option value="hidden">مخفي (له فواتير سابقة)</option>
         </select>
 
         <select
@@ -276,7 +308,9 @@ export function InventoryPage() {
                     {fmtMoney(unitProfit)}
                   </td>
                   <td className={tdCls}>
-                    {qty <= 0 ? (
+                    {p.isActive === false ? (
+                      <Badge tone="slate">مخفي</Badge>
+                    ) : qty <= 0 ? (
                       <Badge tone="red">نافذ</Badge>
                     ) : qty <= min ? (
                       <Badge tone="amber">منخفض</Badge>
@@ -293,20 +327,32 @@ export function InventoryPage() {
                       >
                         <Eye size={15} />
                       </button>
-                      <button
-                        onClick={() => openEdit(p)}
-                        className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                        title="تعديل"
-                      >
-                        <Pencil size={15} />
-                      </button>
-                      <button
-                        onClick={() => setDeleteTarget(p)}
-                        className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                        title="حذف"
-                      >
-                        <Trash2 size={15} />
-                      </button>
+                      {filter === 'hidden' ? (
+                        <button
+                          onClick={() => handleRestore(p)}
+                          className="flex h-8 items-center justify-center gap-1 rounded-lg px-2 text-xs font-semibold text-emerald-600 transition-colors hover:bg-emerald-50"
+                          title="استعادة المنتج"
+                        >
+                          استعادة
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => openEdit(p)}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                            title="تعديل"
+                          >
+                            <Pencil size={15} />
+                          </button>
+                          <button
+                            onClick={() => setDeleteTarget(p)}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                            title="حذف"
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -442,7 +488,7 @@ export function InventoryPage() {
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
         title="حذف منتج من المخزون"
-        description={`هل أنت متأكد من حذف المنتج "${deleteTarget?.name || ''}"؟ سيتم حذفه تماماً ولن تتمكن من الاسترجاع.`}
+        description={`هل أنت متأكد من حذف المنتج "${deleteTarget?.name || ''}"؟ لو له فواتير بيع أو شراء سابقة، هيتم إخفاؤه فقط (وتقدر تستعيده بعدين من فلتر "مخفي")، ولو مالوش أي فواتير هيتحذف نهائياً.`}
         onConfirm={handleDelete}
       />
     </div>

@@ -14,21 +14,12 @@ import { usePrint } from '@/hooks/usePrint';
 import * as customersApi from '@/services/api/customers';
 import * as salesApi from '@/services/api/sales';
 import * as customerPaymentsApi from '@/services/api/customerPayments';
+import * as customerCreditPayoutsApi from '@/services/api/customerCreditPayouts';
 import * as salesReturnsApi from '@/services/api/salesReturns';
 import { inp, btn, btnOutline, thCls, tdCls } from '@/components/shop/styles';
 
-// Fetched in one call (the backend's max page size) rather than paginated —
-// keeps this page's design close to the original (no pager UI here) while
-// comfortably covering the realistic scale this system targets. A customer
-// with more than 100 invoices/payments/returns ever would only see the most
-// recent 100 of each here.
 const HISTORY_LIMIT = 100;
 
-// Keeps exactly what the person typed on screen (so backspace/clearing feels
-// natural and the cursor never jumps to the end), while only allowing the
-// characters a decimal amount can actually contain — digits and a single
-// decimal point. Same helper as PosPage.jsx/PurchasesPage.jsx — duplicated
-// rather than shared to keep this change contained to the file that needs it.
 const sanitizeDecimalText = (raw) => {
   let value = String(raw).replace(/[^0-9.]/g, '');
   const dot = value.indexOf('.');
@@ -41,18 +32,9 @@ const decimalTextToNumber = (text) => {
   return Number.isNaN(n) ? 0 : n;
 };
 
-// Return quantities are always whole units — same "never force to 0 while
-// typing, no cursor jump" principle as sanitizeDecimalText, just digits only
-// (no decimal point) since you can't return a fractional item.
 const sanitizeIntegerText = (raw) => String(raw).replace(/[^0-9]/g, '');
 const integerTextToNumber = (text) => (text === '' ? 0 : parseInt(text, 10) || 0);
 
-// One id per return ATTEMPT (not per keystroke/render) — generated when the
-// person opens the confirm step for a given invoice, and reused if the
-// submit is retried (network error, etc.) without closing the modal. The
-// backend's unique index on this key is what makes a double-tap/network
-// retry produce exactly one return instead of two (see the phase's backend
-// design note).
 const newIdempotencyKey = () => (
   typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `ret-${Date.now()}-${Math.random().toString(36).slice(2)}`
 );
@@ -63,6 +45,7 @@ export function CustomerDetailsPage() {
   const [customer, setCustomer] = useState(null);
   const [sales, setSales] = useState([]);
   const [payments, setPayments] = useState([]);
+  const [payouts, setPayouts] = useState([]);
   const [returns, setReturns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
@@ -73,15 +56,21 @@ export function CustomerDetailsPage() {
   const [confirmingPayment, setConfirmingPayment] = useState(false);
   const [submittingPayment, setSubmittingPayment] = useState(false);
   const [paymentIdemKey, setPaymentIdemKey] = useState('');
+  const [showPayoutModal, setShowPayoutModal] = useState(false);
+  const [payoutAmountText, setPayoutAmountText] = useState('');
+  const [confirmingPayout, setConfirmingPayout] = useState(false);
+  const [submittingPayout, setSubmittingPayout] = useState(false);
+  const [payoutIdemKey, setPayoutIdemKey] = useState('');
   const [deletePaymentTarget, setDeletePaymentTarget] = useState(null);
   const [deletingPayment, setDeletingPayment] = useState(false);
+  const [deletePayoutTarget, setDeletePayoutTarget] = useState(null);
+  const [deletingPayout, setDeletingPayout] = useState(false);
 
-  // Returns flow: 'pick-invoice' -> 'pick-items' -> 'confirm'
   const [showReturnModal, setShowReturnModal] = useState(false);
   const [returnStep, setReturnStep] = useState('pick-invoice');
-  const [returnable, setReturnable] = useState(null); // { saleId, invoiceNumber, items: [...] }
+  const [returnable, setReturnable] = useState(null);
   const [loadingReturnable, setLoadingReturnable] = useState(false);
-  const [returnQtyText, setReturnQtyText] = useState({}); // { [productId]: rawText }
+  const [returnQtyText, setReturnQtyText] = useState({});
   const [returnIdemKey, setReturnIdemKey] = useState('');
   const [submittingReturn, setSubmittingReturn] = useState(false);
 
@@ -89,16 +78,18 @@ export function CustomerDetailsPage() {
     setLoading(true);
     setNotFound(false);
     try {
-      const [customerRes, salesRes, paymentsRes, returnsRes] = await Promise.all([
+      const [customerRes, salesRes, paymentsRes, returnsRes, payoutsRes] = await Promise.all([
         customersApi.getCustomer(id),
         salesApi.listSales({ customerId: id, limit: HISTORY_LIMIT }),
         customerPaymentsApi.listCustomerPayments({ customerId: id, limit: HISTORY_LIMIT }),
         salesReturnsApi.listSalesReturns({ customerId: id, limit: HISTORY_LIMIT }),
+        customerCreditPayoutsApi.listCustomerCreditPayouts({ customerId: id, limit: HISTORY_LIMIT }),
       ]);
       setCustomer(customerRes.data);
       setSales(salesRes.data);
       setPayments(paymentsRes.data);
       setReturns(returnsRes.data);
+      setPayouts(payoutsRes.data);
     } catch (err) {
       if (err.status === 404) setNotFound(true);
       else toast.error(err.message || 'تعذر تحميل بيانات العميل');
@@ -128,6 +119,11 @@ export function CustomerDetailsPage() {
   const paymentValid = paymentAmount > 0 && !paymentExceedsRemaining;
   const newBalancePreview = Math.max(0, t.remaining - Math.min(paymentAmount, t.remaining));
 
+  const payoutAmount = decimalTextToNumber(payoutAmountText);
+  const payoutExceedsCreditOwed = payoutAmount > (t.creditOwed || 0);
+  const payoutValid = payoutAmount > 0 && !payoutExceedsCreditOwed;
+  const newCreditOwedPreview = Math.max(0, (t.creditOwed || 0) - Math.min(payoutAmount, t.creditOwed || 0));
+
   const openPaymentModal = () => {
     setPaymentAmountText('');
     setConfirmingPayment(false);
@@ -141,6 +137,19 @@ export function CustomerDetailsPage() {
     setPaymentAmountText('');
   };
 
+  const openPayoutModal = () => {
+    setPayoutAmountText('');
+    setConfirmingPayout(false);
+    setPayoutIdemKey(newIdempotencyKey());
+    setShowPayoutModal(true);
+  };
+  const closePayoutModal = () => {
+    if (submittingPayout) return;
+    setShowPayoutModal(false);
+    setConfirmingPayout(false);
+    setPayoutAmountText('');
+  };
+
   const submitPayment = async () => {
     setSubmittingPayment(true);
     try {
@@ -149,12 +158,29 @@ export function CustomerDetailsPage() {
       setShowPaymentModal(false);
       setConfirmingPayment(false);
       setPaymentAmountText('');
-      await load(); // refresh totals + sales + payments from the server
+      await load();
     } catch (err) {
       toast.error(err.message || 'تعذر تسجيل السداد');
-      setConfirmingPayment(false); // back to the input step so they can adjust and retry
+      setConfirmingPayment(false);
     } finally {
       setSubmittingPayment(false);
+    }
+  };
+
+  const submitPayout = async () => {
+    setSubmittingPayout(true);
+    try {
+      await customerCreditPayoutsApi.createCustomerCreditPayout({ customerId: id, amount: payoutAmount, idempotencyKey: payoutIdemKey });
+      toast.success('تم دفع المستحق للعميل، وتم خصمه من الصندوق');
+      setShowPayoutModal(false);
+      setConfirmingPayout(false);
+      setPayoutAmountText('');
+      await load();
+    } catch (err) {
+      toast.error(err.message || 'تعذر تسجيل الدفع');
+      setConfirmingPayout(false);
+    } finally {
+      setSubmittingPayout(false);
     }
   };
 
@@ -165,7 +191,7 @@ export function CustomerDetailsPage() {
       await customerPaymentsApi.deleteCustomerPayment(deletePaymentTarget._id);
       toast.success('تم حذف السداد وإعادة المبلغ للصندوق');
       setDeletePaymentTarget(null);
-      await load(); // refresh totals + payments from the server
+      await load();
     } catch (err) {
       toast.error(err.message || 'تعذر حذف السداد');
     } finally {
@@ -173,7 +199,20 @@ export function CustomerDetailsPage() {
     }
   };
 
-  // ---- Returns flow ----
+  const handleDeletePayout = async () => {
+    if (!deletePayoutTarget) return;
+    setDeletingPayout(true);
+    try {
+      await customerCreditPayoutsApi.deleteCustomerCreditPayout(deletePayoutTarget._id);
+      toast.success('تم حذف عملية الدفع، ورجع المبلغ لرصيد الصندوق');
+      setDeletePayoutTarget(null);
+      await load();
+    } catch (err) {
+      toast.error(err.message || 'تعذر حذف العملية');
+    } finally {
+      setDeletingPayout(false);
+    }
+  };
 
   const openReturnModal = () => {
     setReturnStep('pick-invoice');
@@ -204,9 +243,6 @@ export function CustomerDetailsPage() {
     }
   };
 
-  // Lines the person actually entered a quantity for (>0), each carrying its
-  // own validity against that specific product's availableToReturn — a
-  // typo on one line never silently blocks or corrupts another.
   const returnLines = (returnable?.items || [])
     .map((it) => {
       const qty = integerTextToNumber(returnQtyText[it.productId] || '');
@@ -229,10 +265,10 @@ export function CustomerDetailsPage() {
       });
       toast.success('تم تسجيل المرتجع بنجاح');
       closeReturnModal();
-      await load(); // refresh totals + stock-affecting views + history from the server
+      await load();
     } catch (err) {
       toast.error(err.message || 'تعذر تسجيل المرتجع');
-      setReturnStep('pick-items'); // back to the input step so they can adjust and retry (same idempotency key)
+      setReturnStep('pick-items');
     } finally {
       setSubmittingReturn(false);
     }
@@ -246,7 +282,6 @@ export function CustomerDetailsPage() {
         <ArrowRight size={15} /> العودة للعملاء
       </Link>
 
-      {/* Header */}
       <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
@@ -265,6 +300,14 @@ export function CustomerDetailsPage() {
             >
               <Wallet size={15} /> تسجيل سداد
             </button>
+            {t.creditOwed > 0 && (
+              <button
+                onClick={openPayoutModal}
+                className={`${btn} !h-9 !bg-emerald-600 hover:!bg-emerald-700`}
+              >
+                <Wallet size={15} /> دفع مستحق للعميل
+              </button>
+            )}
             <button
               onClick={openReturnModal}
               disabled={sales.length === 0}
@@ -311,7 +354,6 @@ export function CustomerDetailsPage() {
         </div>
       </div>
 
-      {/* Sales history */}
       <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
         <table className="w-full text-start">
           <thead>
@@ -342,9 +384,6 @@ export function CustomerDetailsPage() {
         {sales.length === 0 && <Empty text="لا توجد فواتير مسجلة لهذا العميل" />}
       </div>
 
-      {/* Payment (settlement) history — standalone from the sales above:
-          each row here reduces the customer's running balance without
-          changing any invoice's own recorded paid/remaining. */}
       <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
         <div className="border-b border-border px-4 py-3">
           <h3 className="text-sm font-semibold text-foreground">سجل السداد</h3>
@@ -380,9 +419,43 @@ export function CustomerDetailsPage() {
         {payments.length === 0 && <Empty text="لا توجد عمليات سداد مسجلة لهذا العميل" />}
       </div>
 
-      {/* Returns history — standalone from the sales above: each row here
-          restores stock and reduces the customer's running balance without
-          changing the original sale's own recorded items/paid/remaining. */}
+      {(payouts.length > 0 || t.creditOwed > 0) && (
+        <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
+          <div className="border-b border-border px-4 py-3">
+            <h3 className="text-sm font-semibold text-foreground">سجل دفع المستحق للعميل</h3>
+          </div>
+          <table className="w-full text-start">
+            <thead>
+              <tr className="border-b border-border bg-muted/30">
+                <th className={thCls}>التاريخ والوقت</th>
+                <th className={thCls}>المبلغ المدفوع</th>
+                <th className={thCls}>المستحق بعد الدفع</th>
+                <th className={thCls}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {payouts.map((p) => (
+                <tr key={p._id} className="border-b border-border last:border-0 hover:bg-muted/30">
+                  <td className={`${tdCls} text-muted-foreground`}>{fmtDateTime(p.date)}</td>
+                  <td className={`${tdCls} font-mono font-semibold text-destructive`}>{fmtMoney(p.amount)}</td>
+                  <td className={`${tdCls} font-mono`}>{fmtMoney(p.creditOwedAfter)}</td>
+                  <td className={`${tdCls} text-end`}>
+                    <button
+                      onClick={() => setDeletePayoutTarget(p)}
+                      className="rounded-lg p-1.5 text-destructive hover:bg-destructive/10 transition-colors"
+                      title="حذف عملية الدفع (تسجيل غلط)"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {payouts.length === 0 && <Empty text="لا توجد عمليات دفع مستحق مسجلة لهذا العميل" />}
+        </div>
+      )}
+
       <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
         <div className="border-b border-border px-4 py-3">
           <h3 className="text-sm font-semibold text-foreground">سجل المرتجعات</h3>
@@ -415,7 +488,6 @@ export function CustomerDetailsPage() {
         {returns.length === 0 && <Empty text="لا توجد مرتجعات مسجلة لهذا العميل" />}
       </div>
 
-      {/* Record payment modal */}
       <Modal open={showPaymentModal} onClose={closePaymentModal} title="تسجيل سداد">
         {!confirmingPayment ? (
           <div className="grid gap-4">
@@ -479,7 +551,69 @@ export function CustomerDetailsPage() {
         )}
       </Modal>
 
-      {/* Return flow modal: pick invoice -> pick quantities per product -> confirm */}
+      <Modal open={showPayoutModal} onClose={closePayoutModal} title="دفع مستحق للعميل">
+        {!confirmingPayout ? (
+          <div className="grid gap-4">
+            <div className="rounded-lg bg-muted/40 p-3 text-sm">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">المستحق للعميل حاليًا</span>
+                <b className="font-mono text-emerald-700">{fmtMoney(t.creditOwed || 0)}</b>
+              </div>
+            </div>
+
+            <Field label="المبلغ اللي هتدفعه">
+              <input
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                autoFocus
+                className={`${inp} font-mono`}
+                value={payoutAmountText}
+                onChange={(e) => setPayoutAmountText(sanitizeDecimalText(e.target.value))}
+                placeholder="0"
+              />
+              {payoutExceedsCreditOwed && (
+                <p className="mt-1 text-xs font-semibold text-destructive">المبلغ أكبر من المستحق الفعلي لهذا العميل</p>
+              )}
+            </Field>
+
+            <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">المستحق الجديد بعد الدفع</span>
+                <b className="font-mono text-primary">{fmtMoney(newCreditOwedPreview)}</b>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button className={btnOutline} onClick={closePayoutModal}>إلغاء</button>
+              <button className={btn} disabled={!payoutValid} onClick={() => setConfirmingPayout(true)}>
+                متابعة
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid gap-5">
+            <div className="flex items-start gap-3">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-50">
+                <CheckCircle2 size={16} className="text-emerald-600" />
+              </div>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                هل تريد دفع <b className="font-mono text-foreground">{fmtMoney(payoutAmount)}</b> نقدًا من الصندوق
+                للعميل <b className="text-foreground">{customer.name}</b>؟
+                <br />
+                سيصبح المستحق له <b className="font-mono text-foreground">{fmtMoney(newCreditOwedPreview)}</b>.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button className={btnOutline} onClick={() => setConfirmingPayout(false)} disabled={submittingPayout}>رجوع</button>
+              <button className={btn} onClick={submitPayout} disabled={submittingPayout}>
+                {submittingPayout && <Loader2 size={14} className="animate-spin" />} تأكيد الدفع
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
       <Modal open={showReturnModal} onClose={closeReturnModal} title="تسجيل مرتجع" wide={returnStep !== 'pick-invoice'}>
         {returnStep === 'pick-invoice' && (
           <div className="grid gap-3">
@@ -703,10 +837,35 @@ export function CustomerDetailsPage() {
               </>
             )}
 
+            {payouts.length > 0 && (
+              <>
+                <h2 className="mb-2 mt-6 text-base font-bold">سجل دفع المستحق للعميل</h2>
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-black/20">
+                      <th className="p-2 text-start">التاريخ والوقت</th>
+                      <th className="p-2 text-start">المبلغ المدفوع</th>
+                      <th className="p-2 text-start">المستحق بعد الدفع</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payouts.map((p) => (
+                      <tr key={p._id} className="border-b border-black/10">
+                        <td className="p-2">{fmtDateTime(p.date)}</td>
+                        <td className="p-2 font-mono">{fmtMoney(p.amount)}</td>
+                        <td className="p-2 font-mono">{fmtMoney(p.creditOwedAfter)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            )}
+
             <div className="mt-4 flex justify-end gap-8 text-sm font-bold">
               <span>الإجمالي: {fmtMoney(t.total)}</span>
               <span>المدفوع: {fmtMoney(t.paid)}</span>
               <span>المتبقي: {fmtMoney(t.remaining)}</span>
+              {t.creditOwed > 0 && <span>المستحق للعميل: {fmtMoney(t.creditOwed)}</span>}
             </div>
           </div>
         </PrintPortal>
@@ -718,6 +877,14 @@ export function CustomerDetailsPage() {
         title="حذف سداد"
         description={`هل أنت متأكد من حذف سداد بقيمة ${fmtMoney(deletePaymentTarget?.amount || 0)}؟ سيتم إعادة المبلغ للصندوق ورصيد العميل سيرتفع بنفس القيمة.`}
         onConfirm={handleDeletePayment}
+      />
+
+      <Confirm
+        open={!!deletePayoutTarget}
+        onClose={() => { if (!deletingPayout) setDeletePayoutTarget(null); }}
+        title="حذف عملية دفع مستحق"
+        description={`هل أنت متأكد من حذف عملية دفع بقيمة ${fmtMoney(deletePayoutTarget?.amount || 0)}؟ سيرجع المبلغ لرصيد الصندوق، والمستحق للعميل سيرتفع بنفس القيمة.`}
+        onConfirm={handleDeletePayout}
       />
     </div>
   );
